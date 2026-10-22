@@ -527,11 +527,14 @@ Or you can directly download our processed pickle data.
 2. **Train TrAssembler**:
 ```bash
 # Using default config
-python TrAssembler/train.py --category chair
+python TrAssembler/train.py category=chair
 
 # With custom parameters
-python TrAssembler/train.py --category chair --batch_size 16 --max_epochs 150 --lr 2e-4
+python TrAssembler/train.py category=chair batch_size=16 max_epochs=150 lr=2e-4
 ```
+
+TrAssembler training uses Hydra overrides (`key=value`), rather than `--key value` flags.
+Defaults are defined in `TrAssembler/config.yaml`; `category=chair` is optional because chair is the default.
 
 3. **Evaluate the model**:
 ```bash
