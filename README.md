@@ -103,6 +103,49 @@ source img2cad_env/bin/activate  # On Windows: img2cad_env\Scripts\activate
 pip install -r requirements.txt
 ```
 
+#### Native Windows CAD dependency
+
+TrAssembler evaluation requires `pythonocc-core` (the `OCC` Python module).
+The Windows binary distribution is installed with Conda; the pip virtual
+environment above does not include it. From an Anaconda PowerShell prompt:
+
+```powershell
+conda create --prefix .\img2cad_conda --override-channels -c conda-forge python=3.12 pythonocc-core=7.8.1 numpy=1.26.2 pip
+conda activate .\img2cad_conda
+python -m pip install -r requirements-w.txt
+```
+
+If `data/windows-pip-migration.txt` exists, it records the packages from the
+previous virtual environment and can be used to restore those versions:
+
+```powershell
+python -m pip install -r data/windows-pip-migration.txt
+```
+
+Use the Conda environment when running evaluation so the CAD DLLs can be found.
+Alternatively, `tools/run_windows.py` runs Python in that environment:
+
+```powershell
+python tools/run_windows.py TrAssembler/eval.py --model_dir data/ckpts/trassembler/chair --text_emb_retrieval
+```
+
+Installing PythonOCC supplies the CAD library only. GMFlow dependencies and
+CUDA compilation tools are also required for a complete evaluation run.
+
+Install GMFlow's pinned Python dependencies in the Conda environment with:
+
+```powershell
+python -m pip install setuptools==80.9.0
+python -m pip install --no-build-isolation -r requirements-gmflow-windows.txt
+conda install --override-channels -c nvidia -c conda-forge cuda-nvcc=11.8 cuda-cudart=11.8 cuda-cudart-dev=11.8 cuda-cccl=11.8 cuda-version=11.8
+conda install --override-channels -c nvidia -c conda-forge cuda-version=11.8 libcublas=11.11.3.6 libcublas-dev=11.11.3.6 libcusparse=11.7.5.86 libcusparse-dev=11.7.5.86 libcusolver=11.4.1.48 libcusolver-dev=11.4.1.48
+```
+
+CUDA 11.8 needs a compatible C++ compiler. In Visual Studio Installer, install
+the individual component **MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.38-17.8)**.
+The Windows launcher selects this compiler and the environment-local CUDA Toolkit
+and stores compiled extensions under `data/.cache/torch_extensions`.
+
 ### Pretrained Models
 
 Download pretrained model checkpoints from Hugging Face:
@@ -222,7 +265,7 @@ The **raw annotated `.h5` files** store the CAD command data for each object. Th
 
 ### Stage 1: Discrete Structure Prediction with LlamaFT
 
-1. **Fine-tune the vision-language model**:
+1. **Fine-tune the vision-language model (optional; skip when using pretrained adapters)**:
 ```bash
 python LlamaFT/finetune.py --category chair --nepochs 10 --output_dir data/ckpts/llamaft
 ```
@@ -231,6 +274,13 @@ python LlamaFT/finetune.py --category chair --nepochs 10 --output_dir data/ckpts
 ```bash
 python LlamaFT/infer.py --category chair --split test --out_dir data/output/llamaft_h5/chair  # This will be used for the inference of TrAssembler
 ```
+
+The pretrained LlamaFT checkpoints are adapters and also require access to
+`meta-llama/Llama-3.2-11B-Vision-Instruct`. Authenticate with `hf auth login`
+after obtaining access on the model's Hugging Face page. On GPUs with limited
+memory, inference falls back to offloading token embeddings and the output head to CPU memory;
+this can substantially increase generation time. Test with `--max_samples 1`
+before processing a full split.
 
 ### Stage 2: Continuous Parameter Prediction with TrAssembler
 

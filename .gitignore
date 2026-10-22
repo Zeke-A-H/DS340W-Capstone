@@ -104,6 +104,7 @@ ENV/
 env.bak/
 venv.bak/
 img2cad_env/
+img2cad_conda/
 
 # Spyder project settings
 .spyderproject

@@ -3,7 +3,6 @@ import matplotlib.lines as lines
 import matplotlib.patches as patches
 from .math_utils import rads_to_degs, angle_from_vector_to_x
 from .macro import *
-from icecream import ic
 
 # FIXME: these two functions can be treated as static method
 def construct_curve_from_dict(stat):

@@ -8,8 +8,9 @@ import torch.optim as optim
 import numpy as np
 from cadlib.macro import *
 from einops import rearrange
-from dataset import collate_fn
+# Load CAD DLLs before dataset imports OpenCV's bundled native libraries.
 from cadlib.visualize import vec2CADsolid
+from dataset import collate_fn
 from utils.io import cad_to_obj
 from tqdm import tqdm
 import clip
@@ -511,6 +512,13 @@ def main():
         if config.category not in ('chair', 'table', 'storagefurniture'):
             raise ValueError('Pass --category chair, table, or storagefurniture')
         logging.warning('Checkpoint has no Hydra config; using repository defaults for %s', config.category)
+    h5_root = Path(args.data_root) / 'output' / 'llamaft_h5' / config.category
+    if not any(h5_root.glob('*.h5')):
+        raise FileNotFoundError(
+            f'No Stage 1 structure predictions found in {h5_root}. '
+            f'Run LlamaFT/infer.py --category {config.category} --split test first '
+            '(requires the Llama base model and the category adapter).'
+        )
     stats_path = Path(args.data_root) / f'{config.category}_mean_scale_stats.json'
     if not stats_path.is_file():
         stats_path = model_dir / f'{config.category}_mean_scale_stats.json'
@@ -543,7 +551,6 @@ def main():
     test_ids = open(f'data/splits/{config.category}_test_ids.txt').read().splitlines()
     test_ids = [int(i) for i in test_ids]
 
-    h5_root = Path(f'data/output/llamaft_h5/{config.category}')
     gt_data_root = Path(f'data/raw_annotated/{config.category}')
 
     occs = []

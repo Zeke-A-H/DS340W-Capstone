@@ -30,7 +30,7 @@ from glob import glob
 # Llama-specific imports
 from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-from huggingface_hub import login
+from huggingface_hub import login, get_token
 
 # Add utils to path for cmd2vec
 import sys
@@ -408,16 +408,38 @@ def load_model_and_processor(model_id, adapter_path):
         bnb_4bit_quant_type="nf4", 
         bnb_4bit_compute_dtype=torch.bfloat16
     )
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_id,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        quantization_config=bnb_config
-    )
+    load_kwargs = dict(torch_dtype=torch.bfloat16, quantization_config=bnb_config)
+    try:
+        model = AutoModelForVision2Seq.from_pretrained(model_id, device_map="auto", **load_kwargs)
+    except ValueError as error:
+        if "Some modules are dispatched on the CPU or the disk" not in str(error):
+            raise
+        print("GPU memory is limited; offloading token embeddings and the output head to CPU memory.")
+        bnb_config.llm_int8_enable_fp32_cpu_offload = True
+        device_map = {
+            'vision_model': 0,
+            'multi_modal_projector': 0,
+            'language_model.model': 0,
+            'language_model.model.embed_tokens': 'cpu',
+            'language_model.lm_head': 'cpu',
+        }
+        model = AutoModelForVision2Seq.from_pretrained(model_id, device_map=device_map, **load_kwargs)
     
     # Load PEFT model with adapter
     print(f"Loading adapter: {adapter_path}")
-    model.load_adapter(adapter_path)
+    placement = model.hf_device_map
+    if placement.get('language_model.lm_head') == 'cpu':
+        # This LoRA adapter targets GPU q/v projections, not CPU embeddings/head.
+        # Transformers 4.46 redispatches the already-offloaded head with its
+        # meta placeholder and loses its backing weights. Keep the original
+        # Accelerate hooks while adding the GPU adapters.
+        model.hf_device_map = None
+        try:
+            model.load_adapter(adapter_path, adapter_kwargs={'device': 'cpu'})
+        finally:
+            model.hf_device_map = placement
+    else:
+        model.load_adapter(adapter_path, device_map=placement)
     
     model.eval()
     return model, processor
@@ -464,6 +486,8 @@ def process_single_image(args, img_path, img_id, model, processor, prompt, gener
         
     except Exception as e:
         print(f"Error processing {img_id}: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             'success': False,
             'generation_time': 0,
@@ -514,8 +538,10 @@ def main():
     hf_token = args.hf_token or os.getenv('HF_TOKEN')
     if hf_token:
         login(hf_token)
+    elif get_token():
+        print("Using saved Hugging Face authentication.")
     else:
-        print("Warning: No HF_TOKEN provided. Using public models only.")
+        print("No Hugging Face login found. Run 'hf auth login' for gated Llama access.")
     
     # Set generation parameters based on mode
     generation_params = {

@@ -174,6 +174,7 @@ def collate_fn(data):
             - 'part_cad': List of CAD command vectors per part
             - 'part_name_emb': CLIP embeddings of part names  
             - 'img_tex': Textured image tensor
+            - 'img_non_tex': Optional alternate image (defaults to img_tex)
             - 'part_index': Part ordering indices
             - 'data_id': Unique identifier for the sample
     
@@ -237,7 +238,7 @@ def collate_fn(data):
         batch_data['part_name_emb'].append(part_name_embs)  # [N_part, emb_dim]
         batch_data['part_index'].append(item['part_index'])  # [N_part]
         batch_data['img_tex'].append(item['img_tex'])
-        batch_data['img_non_tex'].append(item['img_non_tex'])
+        batch_data['img_non_tex'].append(item.get('img_non_tex', item['img_tex']))
         batch_data['data_id'].append(item['data_id'])
 
     # Convert lists to tensors
@@ -342,8 +343,9 @@ class CADDataset(Dataset):
         cat: Category name ('chair', 'table', 'storagefurniture')
         data_ids: List of data IDs to include (None for all)
         n_bins: Number of quantization bins (for legacy support)
+        need_quantization: Quantize CAD parameters instead of retaining continuous values
     """
-    def __init__(self, cat='chair', data_ids=None, n_bins=256):
+    def __init__(self, cat='chair', data_ids=None, n_bins=256, need_quantization=False):
         super().__init__()
         self.image_transform = Compose(
             [ToTensor(), Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])]
@@ -355,8 +357,10 @@ class CADDataset(Dataset):
             self.all_data = Path(self.raw_data).glob('*/cad.h5')
             self.all_data = [int(p.parent.name) for p in self.all_data]
         
-        self.all_data = data_ids
+        else:
+            self.all_data = list(data_ids)
         self.n_bins = n_bins
+        self.need_quantization = need_quantization
         self.clip_model, _ = clip.load("ViT-B/32", device='cuda')
 
 
@@ -368,7 +372,7 @@ class CADDataset(Dataset):
                     pickle.dump(data, f)
             else:
                 if (folder / f'{self.all_data[index]}.pkl').exists():
-                    os.remove(folder / f'{data["data_id"]}.pkl')
+                    os.remove(folder / f'{self.all_data[index]}.pkl')
                 
     def __getitem__(self, index):
         if index >= len(self):
