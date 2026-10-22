@@ -103,6 +103,240 @@ source img2cad_env/bin/activate  # On Windows: img2cad_env\Scripts\activate
 pip install -r requirements.txt
 ```
 
+#### Linux Slurm server setup
+
+The copied Windows environments (`img2cad_env` and `img2cad_conda`) cannot run
+on Linux. Use `data/env-linux`. The steps below use this cluster's module names
+and the supplied Slurm script. Run commands from the project root.
+
+**1. Request a GPU session (each time you need a new allocation).**
+
+On the login node (`submit02`):
+
+```bash
+cd /storage/work/ejh6103/Img2CAD
+mkdir -p logs
+sbatch tools/slurm-interactive.sbatch
+squeue -u "$USER"
+```
+
+`sbatch` prints a job ID. Wait until its state is `R` (running); `PD` means
+pending. Replace `YOUR_JOB_ID` below with that number:
+
+```bash
+srun --jobid=YOUR_JOB_ID --overlap --pty bash -l
+```
+
+You are now on the allocated compute node. Do not submit another job just because
+the first is pending. If a job expires, request a new allocation.
+
+**2. Configure your compute-node shell (every new session).**
+
+```bash
+cd /storage/work/ejh6103/Img2CAD
+module load miniforge/25.3.0-3
+module load gcc/9.1.0
+```
+
+For a fresh installation only, create the Linux environment now:
+
+```bash
+conda create -p "$PWD/data/env-linux" -c conda-forge python=3.10 pythonocc-core=7.8.1 pip -y
+```
+
+Then activate and configure it:
+
+```bash
+conda activate "$PWD/data/env-linux"
+export CC="$(command -v gcc)"
+export CXX="$(command -v g++)"
+export CUDAHOSTCXX="$CXX"
+export CUDA_HOME="$CONDA_PREFIX"
+export TORCH_EXTENSIONS_DIR="$PWD/data/.cache/torch_extensions_linux"
+export HF_HOME="$PWD/data/.cache/huggingface"
+export MAX_JOBS=4
+export TORCH_CUDA_ARCH_LIST="7.0"
+nvidia-smi
+"$CXX" --version
+```
+
+`7.0` targets the V100 requested by the supplied job script. GCC 9.1 meets the
+PyTorch compiler requirement; the cluster's default compiler may be too old.
+The exports select the compiler, CUDA toolkit, and persistent caches.
+
+For a fresh installation only, install dependencies after configuring the shell:
+
+```bash
+bash tools/setup-linux.sh
+```
+
+The setup script installs the Linux requirements, CUDA 11.8, and GMFlow
+requirements. It omits the unrelated PyPI `apex` package and adds CLIP and
+flow-matching. Skip creation and installation if this environment already works.
+Download the dataset and pretrained checkpoints using the sections below if they
+are not already present.
+
+**3. Authenticate once and check readiness.**
+
+Obtain access to `meta-llama/Llama-3.2-11B-Vision-Instruct` on Hugging Face,
+then log in with a read token. Keep the token private:
+
+```bash
+hf auth login
+```
+
+Authentication is saved under the configured Hugging Face home. On subsequent
+sessions, keep the same `HF_HOME`; you normally do not need to log in again.
+Run the readiness check on the compute node:
+
+```bash
+python tools/check-linux.py
+```
+
+Expect `passed` for CUDA rasterization, the CAD kernel, inference imports, and
+Llama access. The report is saved in `logs/linux-readiness.json`. A successful
+check verifies these components, but does not test the complete Stage 2 pipeline.
+
+**4. Run inference.**
+
+Start with one image and save the readable prediction alongside the HDF5 data:
+
+```bash
+python LlamaFT/infer.py --category chair --split test --max_samples 1 --save_text
+ls -lh data/output/llamaft_h5/chair/*.h5
+```
+
+Stage 1 writes the discrete CAD structure. It overwrites matching `.h5` files;
+`.txt` predictions are updated only with `--save_text`. A successful conversion
+means the output could be written, not that its geometry is accurate.
+
+Run Stage 2 to predict the continuous CAD parameters:
+
+```bash
+python TrAssembler/eval.py --model_dir data/ckpts/hf/trassembler/chair --text_emb_retrieval --skip_processed
+```
+
+Stage 2 reads Stage 1 predictions from `data/output/llamaft_h5/chair` and writes
+to `data/output/trassembler_h5/chair`. An `.h5` file is structured binary data;
+VS Code's text editor does not display it as a 3D model.
+
+After the one-image pipeline works, process the full chair test split by omitting
+`--max_samples`:
+
+```bash
+python LlamaFT/infer.py --category chair --split test --save_text
+python TrAssembler/eval.py --model_dir data/ckpts/hf/trassembler/chair --text_emb_retrieval --skip_processed
+```
+
+Check time remaining before starting a full run. The current job lasts one hour,
+including time spent setting up and downloading. To request more time for a new
+job (subject to cluster limits), edit `#SBATCH --time` and the final `sleep`
+duration in `tools/slurm-interactive.sbatch` together, then submit normally.
+For two hours, use `#SBATCH --time=02:00:00` and `sleep 7200`.
+The sleep keeps the interactive allocation alive; it must cover your session.
+
+**Troubleshooting: `ModuleNotFoundError: No module named 'h5py'`.**
+
+This can mean `python` is running outside the Linux project environment.
+Activate it before running the README's Python commands:
+
+```bash
+module load miniforge/25.3.0-3
+conda activate /storage/work/ejh6103/Img2CAD/data/env-linux
+which python
+python -c "import h5py; print(h5py.__version__)"
+python LlamaFT/infer.py --category chair --split test --out_dir data/output/llamaft_h5/chair --save_text
+```
+
+`which python` should point inside `data/env-linux/bin`. If the import succeeds,
+no reinstall is needed. Alternatively, the wrapper activates that environment:
+
+```bash
+bash tools/run-linux.sh LlamaFT/infer.py --category chair --split test --out_dir data/output/llamaft_h5/chair --save_text
+```
+
+Both inference commands process the full split. The wrapper does not replace the
+compiler and `HF_HOME` setup in step 2.
+
+**Making future inference runs faster.**
+
+- Keep the persistent model cache and process multiple images in one invocation.
+  Each new invocation loads the model again, even when no download is needed.
+- Measure a few representative samples before a full run. The first tested
+  sample took about 20 seconds for generation; 164 samples at that rate would
+  take about 55 minutes, plus model loading. Actual times vary with output length.
+- The current Stage 1 script processes one image at a time and has no batch-size
+  option. Batching would require code changes and additional GPU memory; it is
+  a future optimization to benchmark, not an existing command-line setting.
+- A faster GPU is another option if available through your cluster. Benchmark
+  before changing resource requests. Increasing CPU cores or system RAM alone
+  does not guarantee faster GPU generation.
+- If the script reports CPU offloading, some model layers run in system RAM.
+  A GPU with sufficient memory may avoid that transfer overhead.
+- `--num_tokens` is a maximum output length, not a fixed amount of work.
+  Reducing it will not speed up outputs that already finish below the limit,
+  and setting it too low can truncate the CAD description.
+- Stage 1 currently overwrites existing predictions; it has no resume/skip flag.
+  A future resume feature could avoid recomputing completed samples. Stage 2
+  already supports `--skip_processed`.
+
+**Model downloads and caching.**
+
+The roughly 21 GB of Llama weights are downloaded to the Hugging Face cache on
+first use. Keeping the same `HF_HOME` on shared storage allows later jobs to
+reuse them. Each new Python process still loads the weights from disk into
+memory; that is not another download. Deleting the cache, changing cache paths,
+or selecting uncached model files can require downloads again. The cache uses
+disk space, separate from RAM and GPU memory.
+
+`bash tools/run-linux.sh SCRIPT [arguments]` is a convenience alternative to
+`python SCRIPT [arguments]`: it activates the environment and sets CUDA and
+extension-cache paths. Configure GCC and `HF_HOME` in your shell first as above.
+
+**Allocated resources versus actual usage.**
+
+`tools/slurm-interactive.sbatch` requests:
+
+| Setting | Resource |
+| --- | --- |
+| `#SBATCH --cpus-per-task=4` | 4 allocated CPU cores |
+| `#SBATCH --mem=64G` | 64 GB of system RAM for the job |
+| `#SBATCH --gres=gpu:v100:1` | 1 V100 GPU (the tested node has 32 GB GPU memory) |
+| `#SBATCH --time=01:00:00` | 1-hour allocation |
+| `#SBATCH --account=open` | Allocation account |
+| `#SBATCH --partition=standard` | Scheduling partition |
+
+These are requests, not measurements of consumption. `MAX_JOBS=4` separately
+limits parallel extension compilation workers; it does not request Slurm CPUs.
+To inspect the allocation and time remaining:
+
+```bash
+scontrol show job YOUR_JOB_ID
+squeue -j YOUR_JOB_ID -o "%.18i %.2t %.10M %.10L %.6D %R"
+```
+
+While inference is running, use another terminal connected to the same allocation
+for monitoring:
+
+```bash
+nvidia-smi
+ps -u "$USER" -o pid,pcpu,rss,etime,args --sort=-rss
+sstat -j YOUR_JOB_ID --allsteps --format=JobID,AveCPU,AveRSS,MaxRSS
+```
+
+`nvidia-smi` shows GPU memory and utilization. In `ps`, `RSS` is resident system
+RAM in KiB and `%CPU` is CPU utilization (100% is approximately one CPU core).
+`sstat` provides Slurm accounting samples when enabled; `MaxRSS` is a sampled
+per-task peak, not necessarily total job memory. After the job ends:
+
+```bash
+sacct -j YOUR_JOB_ID --format=JobID,State,Elapsed,AllocCPUS,ReqMem,MaxRSS,TotalCPU
+```
+
+To finish early and release the allocation, exit the compute-node shell and run
+`scancel YOUR_JOB_ID` on the login node. Exiting the shell alone leaves the batch
+script's sleep running until its time expires.
+
 #### Native Windows CAD dependency
 
 TrAssembler evaluation requires `pythonocc-core` (the `OCC` Python module).
