@@ -103,6 +103,138 @@ source img2cad_env/bin/activate  # On Windows: img2cad_env\Scripts\activate
 pip install -r requirements.txt
 ```
 
+#### Expanded scene training dataset (v2)
+
+V2 contains 216 scenes: **152 train, 44 validation, 20 test**. Each split is
+balanced across one to four objects (38/11/5 scenes per count respectively).
+Singletons cycle chairs, tables, and storage furniture. Other scenes contain
+(table, chair), (table, chair, storage furniture), and
+(table, two distinct chairs, storage furniture).
+
+**Only positions vary.** Source orientations and fixed category sizes are
+preserved. Original split files remain unchanged. Canonical model identities
+that occur in multiple original splits, and sources missing required files,
+are excluded. source_split_audit.json records exclusions and original split hashes.
+
+The final dataset resembles the original data layout:
+
+```text
+data/scene_dataset_v2/
+├── raw_annotated/
+│   ├── 1_object/<scene_id>/
+│   ├── 2_objects/<scene_id>/
+│   ├── 3_objects/<scene_id>/
+│   └── 4_objects/<scene_id>/
+├── blender_renderings/<scene_id>.png
+├── splits/{train,val,test}_ids.txt
+├── crops/<instance_id>.png
+├── labels/<instance_id>.structure.json
+├── manifest.json
+├── source_split_audit.json
+├── validation_report.json
+└── _build/                       # Internal recipes and render intermediates
+```
+
+Each raw scene folder contains combined cad.obj, raw.obj, cad.h5, scene.json,
+annotations.json, materials, and objects/<instance_id>/ with individual CAD,
+reference meshes and masks. cad.h5 is a new scene assembly container, not the
+original single-object format. Provenance paths and transforms are documented
+in the dataset README. Existing original data and the 30-scene pilot are preserved.
+
+From the **login node**, submit the complete generation/render/package/check job:
+
+```bash
+cd /storage/work/ejh6103/Img2CAD
+mkdir -p logs
+sbatch tools/slurm-scene-dataset.sbatch
+squeue -u "$USER"
+```
+
+This uses the same account/partition/V100 setup as the existing scripts. It
+resumes incomplete generation, renders with a flat gray background, packages
+CAD ground truth, generates crops/targets, and validates the dataset. Logs are
+logs/scenes-v2-JOB_ID.log. Do not run two v2 jobs simultaneously. Resubmit the
+same script if a job times out; completed renders and packaging are resumable.
+
+train_objects.jsonl, val_objects.jsonl and test_objects.jsonl index padded
+square crops, command-type JSON labels, and continuous CAD targets. Ground-truth
+boxes/categories are supplied: this is a reconstruction baseline, not automatic
+detection. Existing LlamaFT needs a prompt/loader adapter for these JSON labels;
+TrAssembler needs preprocessing rebuilt with scene crops rather than original
+image PKLs. The scripts do not train models or implement whole-scene inference.
+Published checkpoint training exposure and near-duplicate geometry are not
+verified. Final validation checks canonical source separation, identical-CAD
+separation, original split hashes, masks/boxes, crops, geometry and no rotations.
+
+#### Packaged scene dataset
+
+The 30 completed Blender pilot scenes are packaged under `data/scene_dataset/`.
+See `data/scene_dataset/README.md` for the schema. Each scene includes images,
+masks, per-object CAD/reference geometry, combined meshes, and an HDF5 assembly.
+All pilot scenes remain test-only; training and validation lists are empty.
+Training text responses and model integration are not implemented yet.
+The source texture inspection is recorded in `texture_audit.json`.
+
+To create another packaged copy (requires the Linux environment's h5py):
+
+```bash
+data/env-linux/bin/python tools/package_scene_dataset.py --output data/scene_dataset_copy
+```
+
+#### Render the CAD scene pilot with Blender
+
+Blender rendering uses the university module and its bundled Python; the
+Img2CAD Conda environment is not needed. Run on an allocated compute node.
+For the existing interactive allocation, load Blender and test one scene:
+
+```bash
+cd /storage/work/ejh6103/Img2CAD
+module load blender/4.5.1
+blender -b --python-exit-code 1 --python tools/render_scene_pilot_blender.py -- --scene-id 49535
+```
+
+Inspect `data/cad_scene_pilot_blender/scenes/49535/image.png`. If it looks good,
+render all 30 scenes in the same allocation:
+
+```bash
+blender -b --python-exit-code 1 --python tools/render_scene_pilot_blender.py
+```
+
+Alternatively, from the login node submit a dedicated batch job (do not submit
+this as well as running the full render interactively):
+
+```bash
+mkdir -p logs
+sbatch tools/slurm-blender.sbatch
+squeue -u "$USER"
+```
+
+Batch logs are `logs/blender-JOB_ID.log`. This requests one V100, four CPUs,
+16 GB RAM, and two hours. The render job exits when complete. Existing
+interactive allocations remain active until their own timeout or cancellation.
+
+Inputs remain in `data/cad_scene_pilot/`. Outputs go to the separate
+`data/cad_scene_pilot_blender/` folder, keeping scene IDs and source object IDs.
+Each scene has a Blender RGB image, visible/amodal masks, an instance mask,
+updated bounding boxes/visibility in annotations.json, and a reusable scene.blend.
+The combined OBJ is referenced in the original pilot rather than copied.
+Masks are re-rendered from the same camera; they are not copied from the software
+renders. Cameras and placements match within each original scene family.
+The images use Cycles, area lights, a floor, and flat colored materials.
+They are Blender renders, without the original objects' photographic textures.
+
+Completed scenes are skipped when rerunning; annotations.json is the completion
+marker. Interrupted scenes are retried. The manifest lists completed scenes only.
+To change rendering settings, use a new output directory, for example:
+
+```bash
+blender -b --python-exit-code 1 --python tools/render_scene_pilot_blender.py -- --output data/cad_scene_pilot_blender_64 --samples 64
+```
+
+The default device is CUDA and rendering uses 32 samples. `--device CPU` is
+available for a CPU compute allocation. Failures produce a nonzero exit code.
+Model inference is separate and is not started by these rendering commands.
+
 #### Linux Slurm server setup
 
 The copied Windows environments (`img2cad_env` and `img2cad_conda`) cannot run
