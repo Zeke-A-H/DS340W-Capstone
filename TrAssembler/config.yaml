@@ -1,11 +1,21 @@
 # TrAssembler Training Configuration
 
 # Dataset configuration
-category: chair  # Options: chair, table, storagefurniture
+task: geometry  # geometry or placement
+checkpoint_roots:
+  geometry: data/ckpts/trassembler
+  placement: data/ckpts/trassembler_placement
+placement_hidden_dim: 256
+dataset_root: data/scene_dataset_v2
+category: chair  # Options: chair, table, storagefurniture, scene
+dataset: original  # original or scenes
+object_count: null  # null pools all scene sizes; otherwise 1, 2, 3, or 4
+mean_scale_stats_path: null  # Set explicitly when continuing a pretrained model
 
 # Training configuration
 batch_size: 8
 max_epochs: 300
+fast_dev_run: false  # One train/validation batch for a GPU smoke check
 lr: 3e-4
 weight_decay: 1e-2
 seed: 42
@@ -44,11 +54,12 @@ data_root: data
 raw_data_root: data/raw_annotated
 
 # Resume training (optional)
+resume_from_checkpoint: null  # Full model/optimizer/epoch restoration; max_epochs is the total target
 # ckpt: path/to/checkpoint.ckpt
 
 # Hydra configuration
 hydra:
   run:
-    dir: data/ckpts/trassembler/${category}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${checkpoint_roots.${task}}/${category}/${dataset}_${object_count}/${now:%Y-%m-%d_%H-%M-%S}
   job:
     chdir: false

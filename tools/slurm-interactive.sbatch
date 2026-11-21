@@ -4,8 +4,8 @@
 #SBATCH --partition=standard
 #SBATCH --gres=gpu:v100:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --mem=32G
+#SBATCH --time=05:00:00
 #SBATCH --output=logs/slurm-%j.log
 
 set -euo pipefail
@@ -14,4 +14,4 @@ echo "Img2CAD GPU session on $(hostname), job ${SLURM_JOB_ID}"
 nvidia-smi
 echo "Connect from the login node:"
 echo "srun --jobid=${SLURM_JOB_ID} --overlap --pty bash -l"
-sleep 7200
+sleep 18000

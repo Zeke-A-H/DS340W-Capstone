@@ -210,7 +210,7 @@ squeue -u "$USER"
 ```
 
 Batch logs are `logs/blender-JOB_ID.log`. This requests one V100, four CPUs,
-16 GB RAM, and two hours. The render job exits when complete. Existing
+16 GB RAM, and eight hours. The render job exits when complete. Existing
 interactive allocations remain active until their own timeout or cancellation.
 
 Inputs remain in `data/cad_scene_pilot/`. Outputs go to the separate
@@ -360,11 +360,11 @@ python LlamaFT/infer.py --category chair --split test --save_text
 python TrAssembler/eval.py --model_dir data/ckpts/hf/trassembler/chair --text_emb_retrieval --skip_processed
 ```
 
-Check time remaining before starting a full run. The current job lasts one hour,
+Check time remaining before starting a full run. New interactive jobs request eight hours,
 including time spent setting up and downloading. To request more time for a new
 job (subject to cluster limits), edit `#SBATCH --time` and the final `sleep`
 duration in `tools/slurm-interactive.sbatch` together, then submit normally.
-For two hours, use `#SBATCH --time=02:00:00` and `sleep 7200`.
+The new default is `#SBATCH --time=08:00:00` and `sleep 28800`.
 The sleep keeps the interactive allocation alive; it must cover your session.
 
 **Troubleshooting: `ModuleNotFoundError: No module named 'h5py'`.**
@@ -408,9 +408,10 @@ compiler and `HF_HOME` setup in step 2.
 - `--num_tokens` is a maximum output length, not a fixed amount of work.
   Reducing it will not speed up outputs that already finish below the limit,
   and setting it too low can truncate the CAD description.
-- Stage 1 currently overwrites existing predictions; it has no resume/skip flag.
-  A future resume feature could avoid recomputing completed samples. Stage 2
-  already supports `--skip_processed`.
+- Add `--skip_existing` to Stage 1 inference to reuse structurally complete HDF5
+  predictions. Use the same adapter, prompt and settings; this checks output
+  structure, not model identity. Corrupt/partial files are regenerated. Stage 2
+  supports `--skip_processed`.
 
 **Model downloads and caching.**
 
@@ -422,8 +423,50 @@ or selecting uncached model files can require downloads again. The cache uses
 disk space, separate from RAM and GPU memory.
 
 `bash tools/run-linux.sh SCRIPT [arguments]` is a convenience alternative to
-`python SCRIPT [arguments]`: it activates the environment and sets CUDA and
-extension-cache paths. Configure GCC and `HF_HOME` in your shell first as above.
+`python SCRIPT [arguments]`: it activates the environment, loads GCC, and sets
+CUDA, compiler, and persistent extension/Hugging Face cache paths. An explicitly
+set `HF_HOME` is respected; otherwise the project cache is selected.
+
+**Longer jobs and interrupted runs.**
+
+Interactive, Blender and dataset job scripts now request eight hours. The
+interactive script also keeps its allocation alive for eight hours. These edits
+apply to newly submitted jobs, not allocations that are already running.
+The standard partition reports a 14-day maximum; account/QoS limits still apply.
+
+For training or inference, a dedicated batch job avoids holding an interactive
+shell open. From the login node:
+
+```bash
+mkdir -p logs
+sbatch tools/slurm-llama.sbatch LlamaFT/finetune.py --category scene --object_count 3 --nepochs 10
+```
+
+Read `logs/llama-JOB_ID.log`. The job exits when the command finishes. To continue
+interrupted training from the latest saved checkpoint in the same output folder:
+
+```bash
+sbatch tools/slurm-llama.sbatch LlamaFT/finetune.py --category scene --object_count 3 --nepochs 10 --resume_from_checkpoint
+```
+
+Checkpoints now save every 25 optimizer steps (override with `--save_steps N`),
+keeping the most recent two. Resume restores model/optimizer/training state;
+it still reloads base weights into memory. A missing checkpoint is an error;
+`final/` is an inference adapter, not a resumable Trainer checkpoint. Keep the
+same dataset, object count and training settings when resuming. The two-step
+smoke mode saves every step in its separate output directory.
+
+To reuse completed inference outputs after a timeout:
+
+```bash
+sbatch tools/slurm-llama.sbatch LlamaFT/infer.py --category scene --object_count 3 --split test --skip_existing --save_text
+```
+
+The wrapper reuses the project Hugging Face cache, preventing accidental use of
+an empty cache in a new shell. Each new process still loads model weights. Batch
+preparation now processes images once rather than twice; the prompt-mask prefix
+uses tokenization only and retains the alignment check. No loading-time speedup
+has been benchmarked, and no jobs are submitted by editing these files.
 
 **Allocated resources versus actual usage.**
 
@@ -432,9 +475,9 @@ extension-cache paths. Configure GCC and `HF_HOME` in your shell first as above.
 | Setting | Resource |
 | --- | --- |
 | `#SBATCH --cpus-per-task=4` | 4 allocated CPU cores |
-| `#SBATCH --mem=64G` | 64 GB of system RAM for the job |
+| `#SBATCH --mem=32G` | 32 GB of system RAM for the job (peak inference usage has not yet been measured) |
 | `#SBATCH --gres=gpu:v100:1` | 1 V100 GPU (the tested node has 32 GB GPU memory) |
-| `#SBATCH --time=01:00:00` | 1-hour allocation |
+| `#SBATCH --time=05:00:00` | 5-hour allocation |
 | `#SBATCH --account=open` | Allocation account |
 | `#SBATCH --partition=standard` | Scheduling partition |
 
@@ -648,7 +691,48 @@ memory, inference falls back to offloading token embeddings and the output head 
 this can substantially increase generation time. Test with `--max_samples 1`
 before processing a full split.
 
+For scene-derived crops, keep the Stage 1 workflow and select scene category
+and the number of objects in the source scenes (1, 2, 3, or 4):
+
+```bash
+python LlamaFT/finetune.py --category scene --object_count 3 --nepochs 10
+python LlamaFT/infer.py --category scene --object_count 3 --split test --save_text
+```
+
+
+To pool crops from **all scene sizes (1–4 objects)** into one adapter, omit
+`--object_count` in both commands:
+
+```bash
+python LlamaFT/finetune.py --category scene --nepochs 10
+python LlamaFT/infer.py --category scene --split test --save_text
+```
+
+The combined adapter is saved under `data/ckpts/llamaft/scene/all_objects/`
+(with the final adapter in `final/`). Predictions go to
+`data/output/llamaft_h5/scene/all_objects/test/`. These paths are separate from
+count-specific experiments. Inference automatically selects the combined
+adapter; it must be trained first. This still processes individual object crops,
+not whole-scene images. Training uses the train/validation splits, while the
+inference command above uses only the test split.
+
+`--category scene` automatically selects the scene dataset. Each input remains
+one object crop, across all furniture types, filtered by its source scene's
+object count. It does not predict all objects from a whole-scene image.
+Checkpoints are `data/ckpts/llamaft/scene/3_objects/`; predictions are
+`data/output/llamaft_h5/scene/3_objects/test/`, one HDF5 per object instance.
+Scene-trained adapters preserve command order automatically. Use `--smoke_test`
+on the training command for a two-step GPU check; its separate checkpoint root
+is `data/ckpts/llamaft_smoke/scene/3_objects/`. No model run starts automatically.
+See `LlamaFT/README.md` for precision, cross-dataset evaluation and limitations.
+Stage 2 can consume this layout through `TrAssembler/eval.py --dataset scenes`; see the scene workflow below.
+
 ### Stage 2: Continuous Parameter Prediction with TrAssembler
+
+For scene-derived crops, see [TrAssembler scene workflow](TrAssembler/README.md)
+for target preparation, mixed-category training, and per-object HDF5/STEP/OBJ
+inference from scene LlamaFT predictions. Annotated placement and assembly are
+provided by Stage 3 below.
 
 1. **Prepare the dataset** (Optional):
 ```bash
@@ -677,6 +761,47 @@ python TrAssembler/eval.py --model_dir data/ckpts/trassembler/chair --text_emb_r
 ```bash
 python TrAssembler/eval.py --metrics_only --output_dir data/output/trassembler_h5/chair --category chair --eval_partseg  --text_emb_retrieval
 ```
+
+For scene outputs, the same metric families are available through:
+
+```bash
+python TrAssembler/eval.py --dataset scenes --metrics_only --eval_partseg
+# Add --object_count 1, 2, 3, or 4 for a specialized experiment.
+```
+
+Run part segmentation inside a GPU allocation. Results are printed and saved as
+`metrics.json`, `metrics_per_object.csv`, and `metrics_per_object.jsonl` in the
+existing scene prediction folder. See the [scene evaluation guide](TrAssembler/README.md)
+for metric definitions, coverage, retrieval, previews, intermediate saves, and
+optional reference-assisted symmetry refinement.
+
+### Stage 3: Annotated Scene CAD Assembly
+
+[SceneAssembler](SceneAssembler/README.md) combines the reconstructed objects into
+individual placed CAD files and a full scene STEP/OBJ/GLB. It undoes object
+normalization before applying annotated scene transforms. This stage runs on CPU
+and preserves existing predictions.
+
+```bash
+# Check all held-out scene inputs without reconstructing anything.
+data/env-linux/bin/python SceneAssembler/assemble.py --check_inputs
+
+# Generate all scenes in a CPU batch job; replace only prior assembly examples.
+sbatch --account=read_crch_l1ejh6103 SceneAssembler/assemble.sbatch --overwrite
+```
+
+Outputs are under `data/output/scene_assemblies/combined/test/`. This is predicted
+object geometry with ground-truth placement; automatic placement from a new image
+is not implemented. Missing objects are explicitly reported, and incomplete scene
+export requires `--allow_partial`.
+
+### Learned Placement Experiments
+
+Placement training/evaluation is available in both model families via the new
+`placement` task. See [the complete placement workflow](SceneAssembler/PLACEMENT.md).
+Both predict transforms compatible with SceneAssembler's `--placement_source predicted`.
+The current version supplies object boxes and orthographic camera calibration;
+existing CAD structure/geometry checkpoints remain separate and unchanged.
 
 ## 📊 Configuration
 

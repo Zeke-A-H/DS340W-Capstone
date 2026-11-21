@@ -355,10 +355,11 @@ class PointNetFeaturePropagation(nn.Module):
 class PointNet2PartSeg(nn.Module):
     """PointNet2 Part Segmentation model."""
     
-    def __init__(self, num_part: int = 50, normal_channel: bool = False):
+    def __init__(self, num_part: int = 50, normal_channel: bool = False, num_classes: int = 16):
         super().__init__()
         additional_channel = 3 if normal_channel else 0
         self.normal_channel = normal_channel
+        self.num_classes = num_classes
         
         self.sa1 = PointNetSetAbstractionMsg(
             512, [0.1, 0.2, 0.4], [32, 64, 128], 
@@ -374,7 +375,7 @@ class PointNet2PartSeg(nn.Module):
         )
         self.fp3 = PointNetFeaturePropagation(in_channel=1536, mlp=[256, 256])
         self.fp2 = PointNetFeaturePropagation(in_channel=576, mlp=[256, 128])
-        self.fp1 = PointNetFeaturePropagation(in_channel=150 + additional_channel, mlp=[128, 128])
+        self.fp1 = PointNetFeaturePropagation(in_channel=134 + num_classes + additional_channel, mlp=[128, 128])
         self.conv1 = nn.Conv1d(128, 128, 1)
         self.bn1 = nn.BatchNorm1d(128)
         self.drop1 = nn.Dropout(0.5)
@@ -395,7 +396,7 @@ class PointNet2PartSeg(nn.Module):
         
         l2_points = self.fp3(l2_xyz, l3_xyz, l2_points, l3_points)
         l1_points = self.fp2(l1_xyz, l2_xyz, l1_points, l2_points)
-        cls_label_one_hot = cls_label.view(B, 16, 1).repeat(1, 1, N)
+        cls_label_one_hot = cls_label.view(B, self.num_classes, 1).repeat(1, 1, N)
         l0_points = self.fp1(l0_xyz, l1_xyz, torch.cat([cls_label_one_hot, l0_xyz, l0_points], 1), l1_points)
         
         feat = F.relu(self.bn1(self.conv1(l0_points)))
@@ -423,6 +424,8 @@ class PartSegDataset(Dataset):
         category: str,
         n_points: int = 2048,
         data_root: str = 'data',
+        records: Optional[List[dict]] = None,
+        seed: Optional[int] = None,
     ):
         """
         Args:
@@ -437,12 +440,16 @@ class PartSegDataset(Dataset):
         self.data_root = Path(data_root)
         self.normal_channel = False
         
-        # Load test IDs
-        splits_dir = self.data_root / 'splits'
-        id_file = splits_dir / f'{category.lower()}_test_ids.txt'
-        with open(id_file, 'r') as f:
-            self.test_ids = [line.strip() for line in f.readlines()]
-        
+        self.seed = seed
+        self.scene_records = records
+        self.reference_ids = {str(r['sample_id']): str(r['reference_id']) for r in records or []}
+        if records is not None:
+            self.test_ids = [str(r['sample_id']) for r in records]
+        else:
+            id_file = self.data_root / 'splits' / f'{category.lower()}_test_ids.txt'
+            with open(id_file, 'r') as f:
+                self.test_ids = [line.strip() for line in f.readlines()]
+
         # Find obj files
         self.file_mapping = self._find_obj_files()
         
@@ -514,20 +521,23 @@ class PartSegDataset(Dataset):
         self.anno_ids = []  # The ID used to find annotation files
         
         for test_id in self.test_ids:
+            reference_id = self.reference_ids.get(str(test_id), str(test_id))
+            if self.scene_records is not None and not self.file_mapping.get(str(test_id)):
+                continue
             if self.use_id_mapping:
                 # Chair/Table: use mapping to get ShapeNet model ID
-                if str(test_id) in self.anno_to_model:
-                    anno_id = self.anno_to_model[str(test_id)]
+                if reference_id in self.anno_to_model:
+                    anno_id = self.anno_to_model[reference_id]
                     anno_file = self.category_dir / f'{anno_id}.txt'
                     if anno_file.exists():
                         self.valid_ids.append(str(test_id))
                         self.anno_ids.append(anno_id)
             else:
                 # Storagefurniture: annotation files are named by test_id
-                anno_file = self.category_dir / f'{test_id}.txt'
+                anno_file = self.category_dir / f'{reference_id}.txt'
                 if anno_file.exists():
                     self.valid_ids.append(str(test_id))
-                    self.anno_ids.append(str(test_id))
+                    self.anno_ids.append(reference_id)
         
         print(f"Found {len(self.valid_ids)} valid samples with annotations out of {len(self.test_ids)} test IDs")
     
@@ -537,6 +547,8 @@ class PartSegDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
         test_id = self.valid_ids[idx]
         anno_id = self.anno_ids[idx]
+        import zlib
+        sample_seed = None if self.seed is None else (self.seed + zlib.crc32(test_id.encode())) % (2 ** 32)
         
         obj_path = self.file_mapping.get(test_id)
         
@@ -544,11 +556,13 @@ class PartSegDataset(Dataset):
         if obj_path and Path(obj_path).exists():
             try:
                 mesh = trimesh.load(obj_path)
-                cur_points = trimesh.sample.sample_surface_even(mesh, self.n_points)[0]
+                cur_points = trimesh.sample.sample_surface_even(mesh, self.n_points, **({'seed': sample_seed} if sample_seed is not None else {}))[0]
                 if len(cur_points) < self.n_points:
-                    add_points = mesh.sample(self.n_points - len(cur_points))
+                    add_points = (trimesh.sample.sample_surface(mesh, self.n_points - len(cur_points), seed=sample_seed + 1)[0] if sample_seed is not None else mesh.sample(self.n_points - len(cur_points)))
                     cur_points = np.concatenate([cur_points, add_points], axis=0)
             except Exception:
+                if self.scene_records is not None:
+                    raise
                 cur_points = np.random.randn(self.n_points, 3).astype(np.float32)
         else:
             cur_points = np.random.randn(self.n_points, 3).astype(np.float32)
@@ -571,7 +585,7 @@ class PartSegDataset(Dataset):
             gt_points = pc_normalize(gt_points)
             
             # Resample GT points
-            choice = np.random.choice(len(seg), self.n_points, replace=True)
+            choice = (np.random.default_rng(sample_seed).choice(len(seg), self.n_points, replace=True) if sample_seed is not None else np.random.choice(len(seg), self.n_points, replace=True))
             gt_points = gt_points[choice]
             seg = seg[choice]
             
@@ -583,7 +597,7 @@ class PartSegDataset(Dataset):
         
         # Class label
         classes = dict(zip(self.cat.keys(), range(len(self.cat))))
-        cls = np.array([classes.get(self.category, 0)]).astype(np.int32)
+        cls = np.array([0 if self.category.lower() == 'storagefurniture' else classes.get(self.category, 0)]).astype(np.int32)
         
         return cur_points, cls, seg, test_id
 
@@ -599,9 +613,17 @@ def load_partseg_model(
     device: str = 'cuda'
 ) -> PointNet2PartSeg:
     """Load a pre-trained PointNet2 part segmentation model."""
-    model = PointNet2PartSeg(num_part=num_part, normal_channel=normal_channel).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = checkpoint['model_state_dict']
+    # Keep the checkpoint's actual head rather than dropping or inventing weights.
+    # The supplied storage model also has a 50-label head; evaluation masks its 7 labels.
+    actual_parts = int(state['conv2.weight'].shape[0])
+    num_classes = int(state['fp1.mlp_convs.0.weight'].shape[1]) - 134 - (3 if normal_channel else 0)
+    if num_classes < 1:
+        raise ValueError(f'Invalid category-conditioning dimension in {checkpoint_path}')
+    model = PointNet2PartSeg(num_part=actual_parts, normal_channel=normal_channel,
+                            num_classes=num_classes).to(device)
+    model.load_state_dict(state)
     model.eval()
     return model
 
@@ -616,6 +638,9 @@ def evaluate_partseg(
     num_votes: int = 3,
     device: str = 'cuda',
     verbose: bool = True,
+    records: Optional[List[dict]] = None,
+    strict: bool = False,
+    seed: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Evaluate part segmentation accuracy and mIoU.
@@ -656,11 +681,15 @@ def evaluate_partseg(
     ckpt_path = ckpt_dir / 'best_model.pth'
     
     if not ckpt_path.exists():
+        if strict:
+            raise FileNotFoundError(f'Part segmentation checkpoint not found: {ckpt_path}')
         if verbose:
             print(f"Checkpoint not found: {ckpt_path}")
         return {'accuracy': 0.0, 'class_avg_iou': 0.0, 'instance_avg_iou': 0.0}
     
     model = load_partseg_model(str(ckpt_path), num_part=num_part, device=device)
+    num_classes = model.num_classes
+    num_part = model.conv2.out_channels
     
     # Create dataset and dataloader
     dataset = PartSegDataset(
@@ -668,14 +697,18 @@ def evaluate_partseg(
         category=category,
         n_points=num_points,
         data_root=data_root,
+        records=records,
+        seed=seed,
     )
     
     if len(dataset) == 0:
+        if strict:
+            raise ValueError(f'No reconstructed objects with part annotations for {category}')
         if verbose:
             print(f"No valid samples found for {category}")
         return {'accuracy': 0.0, 'class_avg_iou': 0.0, 'instance_avg_iou': 0.0}
     
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0 if records is not None else 4)
     
     # Evaluation
     total_correct = 0
@@ -683,6 +716,7 @@ def evaluate_partseg(
     total_seen_class = [0] * num_part
     total_correct_class = [0] * num_part
     shape_ious = {cat: [] for cat in seg_classes.keys()}
+    per_sample = []
     
     with torch.no_grad():
         iterator = tqdm(dataloader, desc=f'Evaluating {category}') if verbose else dataloader
@@ -736,6 +770,9 @@ def evaluate_partseg(
                     part_ious = np.array(part_ious)[np.array(eval_part_indices)]
                 
                 shape_ious[cat].append(np.mean(part_ious))
+                per_sample.append({'sample_id': str(obj_ids[i]),
+                                   'accuracy': float(np.mean(segp == segl)),
+                                   'instance_avg_iou': float(np.mean(part_ious))})
     
     # Calculate final metrics
     all_shape_ious = []
@@ -757,6 +794,10 @@ def evaluate_partseg(
         'instance_avg_iou': np.mean(all_shape_ious) if all_shape_ious else 0.0,
     }
     
+    if records is not None:
+        metrics.update(num_samples=len(dataset), num_requested=len(records), per_sample=per_sample,
+                       checkpoint=str(ckpt_path), output_labels=num_part, conditioning_classes=num_classes)
+
     if verbose:
         print(f"\n{category} Part Segmentation Results:")
         print(f"  Accuracy: {metrics['accuracy']:.4f}")

@@ -4,6 +4,10 @@ from pathlib import Path
 # Make project imports available when invoked as a script on Windows/Linux.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+
 from torch.utils.data import Dataset, DataLoader
 import torch
 import os
@@ -558,7 +562,207 @@ class CADDataset(Dataset):
     def __len__(self):
         return len(self.all_data)
 
-if __name__ == '__main__':
+def group_name(object_count=None):
+    return 'all_objects' if object_count is None else f'{object_count}_objects'
+
+
+def load_records(dataset_root, split, object_count=None):
+    root = Path(dataset_root)
+    manifest = json.loads((root / 'manifest.json').read_text())
+    counts = {str(s['scene_id']): s['object_count'] for s in manifest['scenes']}
+    records = []
+    for line in (root / f'{split}_objects.jsonl').read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        record['object_count'] = counts[str(record['scene_id'])]
+        if object_count is None or record['object_count'] == object_count:
+            records.append(record)
+    if not records:
+        raise ValueError(f'No scene samples for {split}/{group_name(object_count)}')
+    return records
+
+
+def crop_tensor(path):
+    # Match the original 400x400 tensor convention and permit variable crop sizes.
+    with Image.open(path) as image:
+        rgb = np.asarray(image.convert('RGB').resize((400, 400), Image.Resampling.BILINEAR), dtype=np.float32)
+    return np.moveaxis(rgb / 127.5 - 1., -1, 0).copy()
+
+
+class SceneCADDataset(Dataset):
+    def __init__(self, directory, split):
+        self.directory = Path(directory)
+        self.records = json.loads((self.directory / f'{split}.json').read_text())
+        if not self.records:
+            raise ValueError(f'Empty scene split: {split}')
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        with (self.directory / f"{self.records[index]['sample_id']}.pkl").open('rb') as stream:
+            return pickle.load(stream)
+
+
+class ScenePlacementDataset(Dataset):
+    """Whole-scene context + focused crop, box and calibrated camera; targets optional."""
+    def __init__(self, dataset_root, split, object_count=None, include_targets=True):
+        from SceneAssembler.placement import load_samples
+        self.samples = load_samples(dataset_root, split, object_count, include_targets=include_targets)
+        self.image_transform = Compose([ToTensor(), Normalize(mean=(.485,.456,.406), std=(.229,.224,.225))])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        def image(path):
+            with Image.open(path) as source:
+                return self.image_transform(source.convert('RGB').resize((224,224), Image.Resampling.BILINEAR))
+        batch = dict(full_image=image(sample['image_path']), crop_image=image(sample['crop_path']),
+                     features=torch.tensor(sample['features']), sample_id=sample['sample_id'],
+                     scene_id=sample['scene_id'], category=sample['category'])
+        if 'target' in sample:
+            batch['target'] = torch.tensor(sample['target'])
+        return batch
+
+
+def normalize_vector(vector, scale):
+    result = np.array(vector, dtype=np.float64, copy=True)
+    result = result[result[:, 0] != 3]  # EOS is sequence padding, not a CAD operation.
+    curves = np.isin(result[:, 0], [0, 1, 2])
+    circles = result[:, 0] == 2
+    extrusions = result[:, 0] == 5
+    result[curves, 1:3] *= scale
+    result[circles, 5] *= scale
+    result[extrusions, 9:12] *= scale
+    result[extrusions, 13:15] *= scale
+    return result
+
+
+def prepare_scenes(dataset_root, output_dir, object_count=None):
+    """Normalize packaged object CAD directly and pair it with the scene crop."""
+    from cadlib.macro import NORM_FACTOR
+    import h5py
+    import clip
+    import torch
+    torch.set_num_threads(4)
+    clip_model = None
+    embedding_cache = {}
+    root, output = Path(dataset_root), Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    # Reuse frozen text embeddings when available; never reuse original images.
+    # CAD geometry always comes from the packaged scene targets.
+    seen = set()
+    for split in ('train', 'val', 'test'):
+        for record in load_records(root, split, object_count):
+            source = ROOT / record['original_preprocessed_sample']
+            if source in seen or not source.is_file():
+                continue
+            seen.add(source)
+            with source.open('rb') as stream:
+                cached = pickle.load(stream)
+            for name, feature in zip(cached['base_part_names'], cached['part_name_emb']):
+                if np.isfinite(feature).all() and np.linalg.norm(feature) > 0:
+                    embedding_cache[name] = feature / np.linalg.norm(feature)
+    moments = {}
+    report = {}
+    for split in ('train', 'val', 'test'):
+        records = load_records(root, split, object_count)
+        for record_index, record in enumerate(records):
+            source = root / record['cad_target']
+            with h5py.File(source) as stream:
+                names = sorted(k for k in stream if k != 'vec' and 'bbox' not in k)
+                vectors = [stream[k][:] for k in names]
+            bounds = compute_bounding_box(source.with_name('cad.obj'))
+            extent = np.array([high - low for low, high in bounds])
+            if not np.isfinite(extent).all() or extent.max() <= 0:
+                raise ValueError(f'Invalid object bounds: {source}')
+            scale = NORM_FACTOR / extent.max()
+            # Apply CADSequence.normalize's uniform scale directly to vectors.
+            # Parsing/re-serializing can drop empty loops and alter Stage 1 structure.
+            normalized = [normalize_vector(vector, scale) for vector in vectors]
+            base_names = [extract_base_name(remove_leading_ending_symbols(n.replace('#', ' '))) for n in names]
+            missing = sorted(set(base_names) - embedding_cache.keys())
+            if missing:
+                if clip_model is None:
+                    clip_model, _ = clip.load('ViT-B/32', device='cpu', download_root=str(ROOT / 'data/.cache/clip'))
+                with torch.no_grad():
+                    features = clip_model.encode_text(clip.tokenize(missing))
+                    features = (features / features.norm(dim=-1, keepdim=True)).numpy()
+                embedding_cache.update(zip(missing, features))
+            indices = np.zeros(len(names))
+            for name in set(base_names):
+                selected = np.where(np.array(base_names) == name)[0]
+                indices[selected] = np.arange(len(selected))
+            item = dict(part_cad=normalized, base_part_names=base_names,
+                        part_name_emb=np.stack([embedding_cache[n] for n in base_names]),
+                        part_index=indices)
+            record = dict(record, source_to_normalized_scale=float(NORM_FACTOR / extent.max()),
+                          coordinate_system='normalized_object_local')
+            item['data_id'] = record['sample_id']
+            item['img_tex'] = crop_tensor(root / record['image'])
+            item['img_non_tex'] = item['img_tex']
+            records[record_index] = record
+            item['scene_metadata'] = record
+            if not item['part_cad'] or any(p.ndim != 2 or p.shape[1] != 17 or not np.isfinite(p).all() for p in item['part_cad']):
+                raise ValueError(f"Invalid continuous target: {source}")
+            if split == 'train':
+                # Use precisely the argument masks and angle conversion used in training.
+                batch = collate_fn([deepcopy(item)])
+                for i in range(batch['args'].shape[-1]):
+                    values = batch['args'][..., i][batch['args_mask'][..., i] > 0].numpy().astype(np.float64)
+                    if values.size:
+                        n, total, squares = moments.get(i, (0, 0., 0.))
+                        moments[i] = (n + values.size, total + values.sum(), squares + (values ** 2).sum())
+            with (output / f"{record['sample_id']}.pkl").open('wb') as stream:
+                pickle.dump(item, stream)
+        (output / f'{split}.json').write_text(json.dumps(records, indent=2) + '\n')
+        report[split] = len(records)
+    stats = {str(i): {'mean': float(total / n), 'std': float(max(squares / n - (total / n) ** 2, 1e-8) ** .5)}
+             for i, (n, total, squares) in moments.items()}
+    (output / 'mean_scale_stats.json').write_text(json.dumps(stats, indent=2) + '\n')
+    print(f'Prepared scene crops: {report}; output: {output}')
+    return report
+
+
+def decode_vectors(batch, predictions):
+    import numpy as np
+    args = batch['args'][0].clone()
+    mask = batch['args_mask'][0] > 0
+    args[mask] = predictions[0][mask]
+    parts = []
+    for p in range(batch['command'].shape[1]):
+        rows = []
+        for l in range(batch['command'].shape[2]):
+            if batch['command_mask'][0, p, l] <= 0:
+                continue
+            command = batch['command'][0, p, l].item()
+            values = args[p, l].detach().cpu().numpy().copy()
+            if command == 1:
+                values[2] *= 180. / np.pi
+                values[3] = 1.
+            rows.append(np.concatenate(([command], values)))
+        if rows:
+            parts.append(np.stack(rows))
+    return parts
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Prepare original or scene-crop TrAssembler data.')
+    parser.add_argument('--dataset', choices=['original', 'scenes'], default='original')
+    parser.add_argument('--dataset_root', type=Path, default=ROOT / 'data/scene_dataset_v2')
+    parser.add_argument('--object_count', type=int, choices=[1, 2, 3, 4], help='Scene size; omit to pool all sizes')
+    parser.add_argument('--output_dir', type=Path, help='Scene prepared-data directory')
+    args = parser.parse_args()
+    if args.dataset == 'scenes':
+        output = args.output_dir or ROOT / 'data/trassembler_data/scene' / group_name(args.object_count)
+        prepare_scenes(args.dataset_root, output, args.object_count)
+        return
+    if args.object_count is not None or args.output_dir is not None:
+        parser.error('--object_count and --output_dir require --dataset scenes')
     np.random.seed(16)
     for cat in ['chair', 'table', 'storagefurniture']:
         out = Path(f'data/trassembler_data/{cat}_pkl')
@@ -577,3 +781,7 @@ if __name__ == '__main__':
         ds.dump_data_to_disk(out)
 
 
+
+
+if __name__ == '__main__':
+    main()

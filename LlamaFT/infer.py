@@ -36,6 +36,7 @@ from huggingface_hub import login, get_token
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.cmd_to_vec import cmd2vec
+from LlamaFT.data import load_scene_samples
 
 
 # ============================================================================
@@ -70,7 +71,7 @@ class CMD_TYPE(Enum):
     LINE = 3
     ARC = 4
     CIRCLE = 5
-    
+
 cmd_mapping = {
     "<SOL>": CMD_TYPE.SOL,
     "<CUT>": CMD_TYPE.CUT,
@@ -129,16 +130,16 @@ def filter_blocks(blocks):
 def parse_cmd_line(line):
     # Remove unwanted characters for robustness
     line = re.sub(r'[<>$]', '', line)
-    
+
     if line.startswith("SOL"):
         return CMD_TYPE.SOL, None
     elif line.startswith("CUT"):
         return CMD_TYPE.CUT, None
-    
+
     # Regex pattern to capture command and arguments
     pattern = re.compile(r'(\w)\s*')
     match = pattern.search(line)
-    
+
     if match:
         cmd_str = match.groups()[0]
         cmd_type = cmd_mapping.get(cmd_str, None)
@@ -177,7 +178,7 @@ def remove_keywords(line):
     line = line.replace("sketch for", "").strip()
     line = line.replace("extrusion of", "").strip()
     line = line.replace("start of", "").strip()
-    
+
     # Split the line into a list of words
     words = line.split()
     # Filter out the unwanted words
@@ -202,7 +203,7 @@ def extract_comments(block, blacklists=('define', 'model', 'program')):
                 sep_locations.append(line.index(sep))
                 seps.append(sep)
         sep = seps[np.argmin(sep_locations)] if sep_locations else None
-        
+
         if sep is not None:
             comment = line.split(sep, 1)[1].strip().lower()
             if not any(bl in comment for bl in blacklists):
@@ -247,13 +248,13 @@ def remove_breaks(lines):
     return lines
 
 
-def get_part_to_cad(lines):
+def get_part_to_cad(lines, preserve_command_order=False):
     lines = filter_lines(lines)
     blocks = divide_lines_into_blocks(lines)
     blocks = filter_blocks(blocks)
     blacklists = ('define', 'model', 'program')
     cmd_blocks = {}
-    
+
     for block in blocks:
         comments, block_lines = extract_comments(block.splitlines(), blacklists)
         if len(comments) > 0:
@@ -261,7 +262,7 @@ def get_part_to_cad(lines):
             cmds = []
             for j, line in enumerate(block_lines):
                 cmd_type, _ = parse_cmd_line(line)
-                
+
                 # TODO, no cut for now, dummy values
                 if cmd_type == CMD_TYPE.SOL:
                     cmds.append([CMD_TYPE.SOL, None])
@@ -277,7 +278,7 @@ def get_part_to_cad(lines):
                     nargs = 3
                 cmds.append([cmd_type, ['0'] * nargs])
             cmd_blocks[comment] = cmds
-        
+
     # convert my cmd to rahul's cmd
     cmd_convert_map = {
         CMD_TYPE.SOL: '<SOL>',
@@ -297,8 +298,8 @@ def get_part_to_cad(lines):
                 arc_loc = len(cmd_blocked_converted[label])
             if cmd_type in cmd_convert_map:
                 cmd_blocked_converted[label].append([cmd_convert_map[cmd_type], [str(arg) for arg in args] if args is not None else None])
-        
-        if arc_loc != -1 and arc_loc < len(cmd_blocked_converted[label]) - 2:
+
+        if not preserve_command_order and arc_loc != -1 and arc_loc < len(cmd_blocked_converted[label]) - 2:
             cmd_block_new = deepcopy(cmd_blocked_converted[label])
             cmd_blocked_converted[label] = cmd_block_new[0:1] + cmd_block_new[arc_loc+1:-1] \
                 + cmd_block_new[1:arc_loc+1] + cmd_block_new[-1:]
@@ -336,11 +337,11 @@ def get_part_to_vec(part_to_cad, use_normal=True):
     return part_to_vec
 
 
-def process_text_to_h5(text_response, output_path):
+def process_text_to_h5(text_response, output_path, preserve_command_order=False):
     """Convert text response to h5 format and save."""
     try:
         # Extract parts to CAD, and all variables.
-        part_to_cad = get_part_to_cad(text_response.splitlines())
+        part_to_cad = get_part_to_cad(text_response.splitlines(), preserve_command_order=preserve_command_order)
         part_to_vec = get_part_to_vec(part_to_cad)  # Transform CAD program into vector format
 
         if part_to_vec:  # Only save if we have valid data
@@ -352,7 +353,7 @@ def process_text_to_h5(text_response, output_path):
             return True
         else:
             return False
-            
+
     except Exception as e:
         print(f"Error processing text to h5: {e}")
         return False
@@ -396,19 +397,27 @@ def generate_description(prompt, sample_image, model, processor, max_new_tokens=
     return output_text[0]
 
 
-def load_model_and_processor(model_id, adapter_path):
+def load_model_and_processor(model_id, adapter_path, precision="auto"):
     """Load the Llama model and processor."""
     processor = AutoProcessor.from_pretrained(model_id)
-    
+
+    if not torch.cuda.is_available():
+        raise RuntimeError('Run inference inside a GPU allocation')
+    supports_bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
+    if precision == 'bf16' and not supports_bf16:
+        raise ValueError('This GPU does not support BF16; use --precision fp16')
+    use_bf16 = supports_bf16 if precision == 'auto' else precision == 'bf16'
+    compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
+
     # Load base model with quantization
     print(f"Loading base model: {model_id}")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True, 
         bnb_4bit_use_double_quant=True, 
         bnb_4bit_quant_type="nf4", 
-        bnb_4bit_compute_dtype=torch.bfloat16
+        bnb_4bit_compute_dtype=compute_dtype
     )
-    load_kwargs = dict(torch_dtype=torch.bfloat16, quantization_config=bnb_config)
+    load_kwargs = dict(torch_dtype=compute_dtype, quantization_config=bnb_config)
     try:
         model = AutoModelForVision2Seq.from_pretrained(model_id, device_map="auto", **load_kwargs)
     except ValueError as error:
@@ -424,7 +433,7 @@ def load_model_and_processor(model_id, adapter_path):
             'language_model.lm_head': 'cpu',
         }
         model = AutoModelForVision2Seq.from_pretrained(model_id, device_map=device_map, **load_kwargs)
-    
+
     # Load PEFT model with adapter
     print(f"Loading adapter: {adapter_path}")
     placement = model.hf_device_map
@@ -440,7 +449,7 @@ def load_model_and_processor(model_id, adapter_path):
             model.hf_device_map = placement
     else:
         model.load_adapter(adapter_path, device_map=placement)
-    
+
     model.eval()
     return model, processor
 
@@ -454,7 +463,7 @@ def process_single_image(args, img_path, img_id, model, processor, prompt, gener
     try:
         # Load and convert image
         sample_image = Image.open(img_path).convert("RGB")
-        
+
         # Generate text response
         start_time = time.time()
         text_response = generate_description(
@@ -462,28 +471,28 @@ def process_single_image(args, img_path, img_id, model, processor, prompt, gener
             max_new_tokens=args.num_tokens, **generation_params
         )
         generation_time = time.time() - start_time
-        
+
         # Convert text to h5
         h5_output_path = os.path.join(args.out_dir, f'{img_id}.h5')
-        h5_success = process_text_to_h5(text_response, h5_output_path)
-        
+        h5_success = process_text_to_h5(text_response, h5_output_path, preserve_command_order=args.preserve_command_order)
+
         # Optionally save text response for debugging
         if args.save_text:
             text_output_path = os.path.join(args.out_dir, f'{img_id}.txt')
             with open(text_output_path, 'w') as f:
                 f.write(text_response)
-        
+
         # Count tokens
         tokens = processor.tokenizer.encode(text_response, add_special_tokens=False)
         token_count = len(tokens)
-        
+
         return {
             'success': h5_success,
             'generation_time': generation_time,
             'token_count': token_count,
             'img_id': img_id
         }
-        
+
     except Exception as e:
         print(f"Error processing {img_id}: {e}")
         import traceback
@@ -497,13 +506,67 @@ def process_single_image(args, img_path, img_id, model, processor, prompt, gener
         }
 
 
+def prediction_is_complete(path):
+    """Reject interrupted or malformed HDF5 files when resuming inference."""
+    try:
+        with h5py.File(path, 'r') as stream:
+            if 'vec' not in stream or stream['vec'].ndim != 2 or stream['vec'].shape[1] != 17:
+                return False
+            parts = [stream[name] for name in stream if name != 'vec']
+            return (bool(parts) and len(stream['vec']) > 0
+                    and all(isinstance(part, h5py.Dataset) and part.ndim == 2
+                            and part.shape[1] == 17 for part in parts)
+                    and sum(len(part) for part in parts) == len(stream['vec']))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def get_image_list(args, project_dir):
+    """Resolve original images or scene crops without loading model weights."""
+    if args.dataset == 'scenes':
+        samples = load_scene_samples(args.category, args.split, getattr(args, "object_count", None))
+        images = [(sample['image_path'], sample['sample_id']) for sample in samples]
+    else:
+        path = Path(project_dir)/'data'/'splits'/f'{args.category}_{args.split}_ids.txt'
+        ids = path.read_text().splitlines()
+        images = []
+        for object_id in ids:
+            image = Path(args.img_dir)/f'{object_id}.png'
+            if not image.is_file():
+                raise FileNotFoundError(image)
+            images.append((str(image), object_id))
+    if args.max_samples is not None:
+        images = images[:args.max_samples]
+    if not images:
+        raise ValueError('No input images found')
+    return images
+
+
+def find_adapter(project_dir, source, category, object_count=None):
+    directory = Path(project_dir)/'data'/'ckpts'/('llamaft_scenes' if source == 'scenes' else 'llamaft')/category
+    if source == 'scenes' and object_count is not None:
+        directory = Path(project_dir)/'data'/'ckpts'/'llamaft'/'scene'/f'{object_count}_objects'
+    if source == 'scenes' and category == 'scene' and object_count is None:
+        directory = Path(project_dir)/'data'/'ckpts'/'llamaft'/'scene'/'all_objects'
+    final = directory/'final'
+    if (final/'adapter_config.json').is_file():
+        return str(final)
+    checkpoints = [p for p in directory.glob('checkpoint-*')
+                   if p.name.split('checkpoint-')[-1].isdigit() and (p/'adapter_config.json').is_file()]
+    if not checkpoints:
+        raise FileNotFoundError(f'No trained adapter in {directory}; train first or pass --adapter_path')
+    return str(max(checkpoints, key=lambda p: int(p.name.split('checkpoint-')[-1])))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Unified Img2CAD inference: images -> h5 files")
-    
+
     # Get project directory
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
+
     # Input/Output paths
+    parser.add_argument('--task', choices=['structure', 'placement'], default='structure')
+    parser.add_argument('--dataset_root', type=Path, default=Path(project_dir)/'data/scene_dataset_v2')
     parser.add_argument('--img_dir', type=str, 
                        default=os.path.join(project_dir, 'data', 'blender_renderings'), 
                        help="source folder for input images")
@@ -511,29 +574,87 @@ def main():
                        help="output folder for h5 files (default: {project_dir}/data/output/llamaft_h5/{category})")
     parser.add_argument('--adapter_path', type=str, default=None, 
                        help="path to fine-tuned adapter (auto-detected if not provided)")
-    
+
+    parser.add_argument('--object_count', type=int, choices=[1, 2, 3, 4], default=None,
+                        help='Select crops from scenes containing this many objects; omit for all scene sizes')
+    parser.add_argument('--dataset', choices=['original', 'scenes'], default='original',
+                        help='Images to evaluate: original objects or scene-derived crops')
+    parser.add_argument('--adapter_source', choices=['original', 'scenes'], default=None,
+                        help='Adapter family; defaults to --dataset. Supports cross-dataset evaluation')
+    parser.add_argument('--precision', choices=['auto', 'fp16', 'bf16'], default='auto')
+
     # Model parameters  
     parser.add_argument('--num_tokens', type=int, default=1024, help="max tokens per response")
     parser.add_argument('--category', default='chair', help="category")
     parser.add_argument('--split', default='test', help="split")
     parser.add_argument('--max_samples', type=int, default=None, 
                        help="evaluate on first k samples only (for quick testing)")
+    parser.add_argument('--skip_existing', action='store_true',
+                        help='Skip structurally complete HDF5 outputs; use only with the same adapter/settings')
     parser.add_argument('--save_text', action='store_true', 
                        help="save intermediate text responses for debugging")
-    
+
+    parser.add_argument("--preserve_command_order", action="store_true",
+                       help="Preserve CAD command order for scene-derived labels; disable legacy arc reordering")
+
     # Authentication
     parser.add_argument('--hf_token', type=str, default=None, 
                        help="Hugging Face token (or set HF_TOKEN environment variable)")
-    
+
     args = parser.parse_args()
-    
+    if args.task == 'placement':
+        if args.max_samples is not None and args.max_samples < 1:
+            parser.error('--max_samples must be positive')
+        if args.adapter_source not in (None, 'scenes'):
+            parser.error('Placement inference requires a placement-trained scene adapter')
+        args.dataset = 'scenes'
+        if args.category != 'scene':
+            parser.error('Placement inference requires --category scene')
+        from LlamaFT.placement import infer as infer_placement
+        infer_placement(args)
+        return
+    if args.category == 'scene':
+        args.dataset = 'scenes'
+    if args.max_samples is not None and args.max_samples < 1:
+        parser.error('--max_samples must be positive')
+    args.adapter_source = args.adapter_source or args.dataset
+    if args.adapter_source == 'scenes':
+        args.preserve_command_order = True
+    if args.category == 'scene' and args.adapter_source == 'original' and args.adapter_path is None:
+        parser.error('Original adapters are category-specific; select a furniture category or pass --adapter_path')
+    image_list = get_image_list(args, project_dir)
+
     # Set default out_dir if not provided by user
     if args.out_dir is None:
-        args.out_dir = os.path.join(project_dir, 'data', 'output', 'llamaft_h5', args.category)
-    
+        if args.category == 'scene' and args.adapter_source == 'scenes':
+            args.out_dir = os.path.join(project_dir, 'data', 'output', 'llamaft_h5',
+                                        'scene', f'{args.object_count}_objects' if args.object_count is not None else 'all_objects', args.split)
+        elif args.dataset == 'original' and args.adapter_source == 'original':
+            args.out_dir = os.path.join(project_dir, 'data', 'output', 'llamaft_h5', args.category)
+        else:
+            args.out_dir = os.path.join(project_dir, 'data', 'output',
+                                        f'llamaft_{args.adapter_source}_on_{args.dataset}_h5',
+                                        args.category, args.split)
+
+    if args.object_count is not None and args.category != 'scene' and args.out_dir is not None:
+        args.out_dir = os.path.join(args.out_dir, f'{args.object_count}_objects')
+
     # Create output directory
     os.makedirs(args.out_dir, exist_ok=True)
-    
+
+    if args.skip_existing:
+        pending = []
+        for image_path, object_id in image_list:
+            output = Path(args.out_dir)/f'{object_id}.h5'
+            text_ready = not args.save_text or output.with_suffix('.txt').is_file()
+            if not prediction_is_complete(output) or not text_ready:
+                pending.append((image_path, object_id))
+        print(f'Skipping {len(image_list)-len(pending)} completed predictions; {len(pending)} remain')
+        image_list = pending
+        if not image_list:
+            print('All selected predictions already exist; no model loading needed')
+            return
+
     # Handle Hugging Face authentication
     hf_token = args.hf_token or os.getenv('HF_TOKEN')
     if hf_token:
@@ -542,63 +663,42 @@ def main():
         print("Using saved Hugging Face authentication.")
     else:
         print("No Hugging Face login found. Run 'hf auth login' for gated Llama access.")
-    
+
     # Set generation parameters based on mode
     generation_params = {
         'top_p': 1.0,
         'temperature': 1.0,
         'do_sample': False
     }
-    
+
     prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompt.txt')
     if args.adapter_path is None:
-        adapter_search_dir = os.path.join(project_dir, 'data', 'ckpts', 'llamaft', args.category)
-        adapter_checkpoints = glob(os.path.join(adapter_search_dir, 'checkpoint-*'))
-        if adapter_checkpoints:
-            args.adapter_path = sorted(adapter_checkpoints, key=lambda x: int(x.split('checkpoint-')[-1]))[-1]
-    
-    assert args.adapter_path is not None, "Adapter path is not provided"
-    
+        args.adapter_path = find_adapter(project_dir, args.adapter_source, args.category, args.object_count)
+
     # Load prompt
     if not os.path.exists(prompt_path):
         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
     prompt = open(prompt_path).read()
-    
+
     # Load model
     model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
     model, processor = load_model_and_processor(
         model_id, 
-        adapter_path=args.adapter_path
+        adapter_path=args.adapter_path,
+        precision=args.precision
     )
-    
+
     # Prepare image list
     print(f"Starting unified inference on {args.category} {args.split} split...")
     print(f"Output directory: {args.out_dir}")
     print(f"Parameters: {generation_params}")
-    
-    # Use split file to get object IDs
-    splits_path = os.path.join(project_dir, 'data', 'splits', f'{args.category}_{args.split}_ids.txt')
-    if not os.path.exists(splits_path):
-        raise FileNotFoundError(f"Split file not found: {splits_path}")
-        
-    obj_ids = open(splits_path).read().splitlines()
-    if args.max_samples is not None:
-        total_ids = len(obj_ids)
-        obj_ids = obj_ids[:args.max_samples]
-        print(f"Processing first {len(obj_ids)} samples out of {total_ids} total")
-    
-    image_list = []
-    for img_id in obj_ids:
-        img_path = os.path.join(args.img_dir, f'{img_id}.png')
-        if os.path.exists(img_path):
-            image_list.append((img_path, img_id))
-        else:
-            print(f"Warning: Image not found: {img_path}")
-    
+
+    print(f'Input dataset: {args.dataset}; adapter source: {args.adapter_source}; images: {len(image_list)}')
+
     # Process images
     results = []
     successful_conversions = 0
-    
+
     for img_path, img_id in tqdm(image_list, desc="Processing images"):
         result = process_single_image(
             args, img_path, img_id, model, processor, prompt, generation_params
@@ -606,12 +706,12 @@ def main():
         results.append(result)
         if result['success']:
             successful_conversions += 1
-    
+
     # Print statistics
     if results:
         generation_times = [r['generation_time'] for r in results if r['success']]
         token_counts = [r['token_count'] for r in results if r['success']]
-        
+
         print("\n" + "="*60)
         print("UNIFIED PIPELINE STATISTICS")
         if args.max_samples is not None:
@@ -620,14 +720,14 @@ def main():
         print(f"Total images processed: {len(results)}")
         print(f"Successful h5 conversions: {successful_conversions}")
         print(f"Success rate: {successful_conversions/len(results)*100:.1f}%")
-        
+
         if generation_times:
             print(f"\nGENERATION TIME PER IMAGE:")
             print(f"  Mean: {statistics.mean(generation_times):.2f} seconds")
             print(f"  Median: {statistics.median(generation_times):.2f} seconds")
             print(f"  Min: {min(generation_times):.2f} seconds")
             print(f"  Max: {max(generation_times):.2f} seconds")
-            
+
         if token_counts:
             print(f"\nTOKENS GENERATED:")
             print(f"  Mean: {statistics.mean(token_counts):.1f} tokens")
@@ -635,9 +735,9 @@ def main():
             print(f"  Min: {min(token_counts)} tokens")
             print(f"  Max: {max(token_counts)} tokens")
             print(f"  Total tokens: {sum(token_counts)} tokens")
-        
+
         print("="*60)
-        
+
         # Save statistics
         stats_path = os.path.join(args.out_dir, 'pipeline_stats.txt')
         with open(stats_path, 'w') as f:
@@ -652,7 +752,7 @@ def main():
                 f.write(f"Mean generation time: {statistics.mean(generation_times):.2f} seconds\n")
             if token_counts:
                 f.write(f"Mean tokens generated: {statistics.mean(token_counts):.1f}\n")
-        
+
         print(f"Statistics saved to: {stats_path}")
 
 

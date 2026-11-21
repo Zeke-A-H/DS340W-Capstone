@@ -169,9 +169,17 @@ def gm_kl_loss(gm, sample, mask, eps=1e-4):
 
 # Data module remains essentially unchanged.
 class CADDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir, cat, batch_size=64):
+    def __init__(self, data_dir, cat, batch_size=64, dataset="original"):
         super().__init__()
         self.batch_size = batch_size
+        self.scene_dataset = dataset == "scenes"
+
+        if dataset == 'scenes':
+            from dataset import SceneCADDataset
+            self.train_ds = SceneCADDataset(data_dir, 'train')
+            self.val_ds = SceneCADDataset(data_dir, 'val')
+            print(f"Scene train: {len(self.train_ds)}, validation: {len(self.val_ds)}")
+            return
 
         train_ids = open(f'data/splits/{cat}_train_ids.txt').read().splitlines()
         train_ids = [int(i) for i in train_ids]
@@ -187,12 +195,69 @@ class CADDataModule(pl.LightningDataModule):
         self.train_ds = torch.utils.data.ConcatDataset([deepcopy(self.train_ds) for _ in range(5)])
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=0 if os.name == 'nt' else 10,
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=0 if self.scene_dataset or os.name == 'nt' else 10,
                           collate_fn=collate_fn, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=1, num_workers=0 if os.name == 'nt' else 1,
+        return DataLoader(self.val_ds, batch_size=1, num_workers=0 if self.scene_dataset or os.name == 'nt' else 1,
                           collate_fn=collate_fn, shuffle=True)
+
+class PlacementModel(pl.LightningModule):
+    """New placement head on the same frozen DINOv2-B/14 used by CAD reconstruction."""
+    def __init__(self, statistics, lr=2e-4, hidden_dim=256, pretrained_backbone=True, backbone=None):
+        super().__init__()
+        self.save_hyperparameters(ignore=['backbone', 'pretrained_backbone'])
+        self.backbone = backbone if backbone is not None else torch.hub.load(
+            'facebookresearch/dinov2', 'dinov2_vitb14', pretrained=pretrained_backbone)
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad = False
+        dimension = self.backbone.embed_dim
+        self.head = nn.Sequential(nn.Linear(dimension*2 + 24, hidden_dim), nn.ReLU(),
+                                  nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim,10))
+        # Start with a well-defined identity rotation; learn translation/log-scale as normalized values.
+        with torch.no_grad():
+            self.head[-1].bias[3:9].copy_(torch.tensor([1.,0.,0.,0.,1.,0.]))
+        for name in ('features','translation','log_scale'):
+            self.register_buffer(name+'_mean', torch.tensor(statistics[name]['mean'],dtype=torch.float32))
+            self.register_buffer(name+'_std', torch.tensor(statistics[name]['std'],dtype=torch.float32))
+        self.lr = lr
+
+    def forward(self, batch):
+        self.backbone.eval()
+        with torch.no_grad():
+            full = self.backbone.forward_features(batch['full_image'])['x_norm_patchtokens'].mean(1)
+            crop = self.backbone.forward_features(batch['crop_image'])['x_norm_patchtokens'].mean(1)
+        features = (batch['features'] - self.features_mean) / self.features_std
+        return self.head(torch.cat([full,crop,features],dim=1))
+
+    def loss(self, batch):
+        predicted = self(batch)
+        target = batch['target']
+        translation = (target[:,:3] - self.translation_mean) / self.translation_std
+        scale = (target[:,9:] - self.log_scale_mean) / self.log_scale_std
+        # Rotation columns are supervised in 6D; decoding enforces a proper SO(3) rotation.
+        return (F.mse_loss(predicted[:,:3],translation) + F.mse_loss(predicted[:,3:9],target[:,3:9])
+                + F.mse_loss(predicted[:,9:],scale))
+
+    def training_step(self,batch,batch_idx):
+        loss=self.loss(batch)
+        self.log('train_loss',loss,on_step=True,on_epoch=True,prog_bar=True,batch_size=len(batch['target']))
+        return loss
+
+    def validation_step(self,batch,batch_idx):
+        loss=self.loss(batch)
+        self.log('val_loss',loss,on_step=False,on_epoch=True,prog_bar=True,batch_size=len(batch['target']))
+        return loss
+
+    def predict_vectors(self,batch):
+        vector=self(batch)
+        vector[:,:3] = vector[:,:3]*self.translation_std + self.translation_mean
+        vector[:,9:] = vector[:,9:]*self.log_scale_std + self.log_scale_mean
+        return vector
+
+    def configure_optimizers(self):
+        return optim.AdamW(self.head.parameters(),lr=self.lr)
+
 
 class GMFlowModel(pl.LightningModule):
     """TrAssembler model for predicting continuous CAD parameters.
@@ -364,7 +429,8 @@ class GMFlowModel(pl.LightningModule):
                 'scale': torch.tensor(v['std'], dtype=torch.float32),
             }
             
-        self.ctx = dr.RasterizeCudaContext()
+        # Scene validation only computes loss and does not render CAD.
+        self.ctx = None if getattr(args, 'dataset', 'original') == 'scenes' else dr.RasterizeCudaContext()
         
         
         
@@ -598,6 +664,9 @@ class GMFlowModel(pl.LightningModule):
         
         self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=B)
         
+        if getattr(self.args, 'dataset', 'original') == 'scenes':
+            return loss
+
         pred_args = self.sample(batch)
         
         # denormalize pred args and gt args
